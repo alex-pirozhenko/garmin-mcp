@@ -23,6 +23,7 @@ COPY src/ ./src/
 
 # Install dependencies using uv
 RUN uv pip install -e .
+RUN uv pip install fastapi uvicorn httpx
 
 # Copy test files (optional, for testing in container)
 COPY tests/ ./tests/
@@ -34,10 +35,10 @@ RUN mkdir -p /root/.garminconnect && \
 
 # Expose the HTTP port. The image defaults to stdio (Claude Desktop, Inspector);
 # set GARMIN_MCP_TRANSPORT=streamable-http to serve over this port (e.g. in k8s).
-# EXPOSE 8000
+EXPOSE 8000
 
 # Set the entrypoint to run the MCP server
-ENTRYPOINT ["garmin-mcp"]
+CMD ["uvicorn", "garmin_mcp.shim:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # Health check (optional - adjust based on your needs)
 # HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

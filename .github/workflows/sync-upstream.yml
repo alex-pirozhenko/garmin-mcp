@@ -1,0 +1,58 @@
+name: Scheduled Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Weekly on Sundays at midnight
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add Upstream Remote
+        run: |
+          git remote add upstream https://github.com/Taxuspt/garmin_mcp.git
+          git fetch upstream
+
+      - name: Create Sync Branch and Merge Upstream
+        id: merge
+        run: |
+          git config --global user.name "alex-pirozhenko-bot"
+          git config --global user.email "alex.pirozhenko+bot@gmail.com"
+          
+          # Create and switch to a temporary sync branch from main
+          git checkout -b sync-upstream-temp origin/main
+          
+          # Attempt to merge upstream main
+          if git merge upstream/main --no-edit; then
+            echo "Merge succeeded without conflicts."
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+          else
+            echo "Merge failed with conflicts. A human needs to resolve this."
+            git merge --abort
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Create Pull Request
+        if: steps.merge.outputs.changes_detected == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: sync-upstream
+          title: "chore: sync with upstream garmin_mcp"
+          body: |
+            Automated upstream sync pull request. 
+            
+            This PR merges the latest changes from the upstream `Taxuspt/garmin_mcp` repository into our fork's `main` branch.
+            
+            Please review the changes, resolve any conflicts if they arise, and merge to trigger a new image build.
+          base: main
