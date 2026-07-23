@@ -11,6 +11,8 @@ Exposes data not available through the REST API:
 - Temperature correlation with HR and power
 - Variability Index per session and lap
 """
+import base64
+import datetime as _dt
 import gzip
 import io
 import json
@@ -88,6 +90,46 @@ def _semicircles_to_degrees(value) -> Optional[float]:
     if value is None:
         return None
     return round(value * (180.0 / 2**31), 6)
+
+
+# ---------------------------------------------------------------------------
+# ConnectIQ developer field discovery (Stryd running power etc.)
+# ---------------------------------------------------------------------------
+#
+# Stryd's ConnectIQ data field writes running power (and derived metrics)
+# into FIT "developer fields" rather than the native power record field,
+# since the watch has no built-in power meter. Developer fields are declared
+# by 'field_description' messages (name, base type, units) that precede the
+# 'record' messages using them, keyed by a name we can query with the FIT
+# SDK's message.get_value(name). We match names case-insensitively since
+# ConnectIQ field names vary slightly across Stryd firmware/app versions.
+
+_STRYD_ALIAS_MAP = {
+    "power": "power",
+    "form power": "form_power",
+    "leg spring stiffness": "leg_spring_stiffness",
+    "air power": "air_power",
+    "vertical oscillation": "vertical_oscillation",
+    "ground time": "ground_time",
+}
+
+
+def _dev_value(message, dev_field_name_by_key: dict, key: str):
+    """Look up a discovered developer field's value on a record message by our internal key."""
+    name = dev_field_name_by_key.get(key)
+    if not name:
+        return None
+    return _get_field(message, name)
+
+
+def _parse_iso(s):
+    """Parse a FIT-style timestamp string ("2026-05-15 02:27:08", optionally with tz) to datetime."""
+    if not s:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +221,89 @@ def _safe_round(value, ndigits: int = 1) -> Optional[float]:
     if value is None:
         return None
     return round(value, ndigits)
+
+
+# ---------------------------------------------------------------------------
+# Normalized Power (30s rolling average, 4th-power mean) + power aggregates
+# ---------------------------------------------------------------------------
+
+def _compute_normalized_power(power_values: List[Optional[float]], window_s: int = 30) -> Optional[float]:
+    """Standard (Coggan) Normalized Power: 30s rolling avg, raised to the 4th
+    power, meaned, then 4th-rooted. Gaps are treated as 0 W (coasting/walking),
+    matching the convention used by _compute_power_duration_curve.
+
+    Falls back to a whole-series window when there's less than window_s of data.
+    """
+    vals = [v if v is not None else 0 for v in power_values]
+    n = len(vals)
+    if n == 0:
+        return None
+    w = min(window_s, n)
+
+    window_sum = sum(vals[:w])
+    rolling = [window_sum / w]
+    for i in range(w, n):
+        window_sum += vals[i] - vals[i - w]
+        rolling.append(window_sum / w)
+
+    if not rolling:
+        return None
+    fourth_power_mean = sum(r ** 4 for r in rolling) / len(rolling)
+    return fourth_power_mean ** 0.25
+
+
+def _compute_power_aggregates_for_range(
+    records: List[Dict], start_ts=None, end_ts=None
+) -> Dict[str, Any]:
+    """Compute avg/max/NP/VI/EF/form-power/leg-spring-stiffness from per-second
+    records, optionally restricted to a [start_ts, end_ts] datetime window.
+
+    Used to backfill session/lap power summaries when power comes from a
+    developer field (e.g. Stryd) rather than a native power-meter aggregate
+    the device would normally precompute itself.
+    """
+    if start_ts is not None or end_ts is not None:
+        sel = []
+        for r in records:
+            ts = _parse_iso(r.get("timestamp"))
+            if ts is None:
+                continue
+            if start_ts is not None and ts < start_ts:
+                continue
+            if end_ts is not None and ts > end_ts:
+                continue
+            sel.append(r)
+    else:
+        sel = records
+
+    powers = [r["power_w"] for r in sel if r.get("power_w") is not None]
+    if not powers:
+        return {}
+
+    out: Dict[str, Any] = {
+        "avg_power_w": round(_safe_avg(powers)),
+        "max_power_w": round(max(powers)),
+    }
+
+    np_w = _compute_normalized_power(powers)
+    if np_w:
+        out["normalized_power_w"] = round(np_w)
+        if out["avg_power_w"]:
+            out["variability_index"] = round(np_w / out["avg_power_w"], 3)
+        hrs = [r["heart_rate_bpm"] for r in sel if r.get("heart_rate_bpm") is not None]
+        avg_hr = _safe_avg(hrs)
+        if avg_hr:
+            out["ef"] = round(np_w / avg_hr, 2)
+
+    form_powers = [r["form_power_w"] for r in sel if r.get("form_power_w") is not None]
+    if form_powers:
+        out["avg_form_power_w"] = round(_safe_avg(form_powers))
+
+    lss_vals = [r["leg_spring_stiffness_kn_m"] for r in sel if r.get("leg_spring_stiffness_kn_m") is not None]
+    if lss_vals:
+        out["avg_leg_spring_stiffness_kn_m"] = round(_safe_avg(lss_vals), 2)
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -392,15 +517,20 @@ def _grade_analysis(records: List[Dict]) -> Optional[Dict]:
 # HR drift / cardiac drift (aerobic decoupling)
 # ---------------------------------------------------------------------------
 
-def _compute_hr_drift(records: List[Dict]) -> Optional[Dict]:
+def _compute_hr_drift(records: List[Dict], min_duration_minutes: float = 60) -> Optional[Dict]:
     """Compute aerobic decoupling (HR drift vs. power over the ride).
 
     Splits the ride into first and second halves by record count.
     Computes power:HR ratio for each half.
     Drift % = change in ratio from first to second half.
     Negative drift = HR increased relative to power (decoupling = less efficient).
+
+    Args:
+        min_duration_minutes: Minimum activity duration (assuming ~1 record/s)
+            required before drift is computed (default 60, i.e. the previous
+            hard-coded floor).
     """
-    MIN_RECORDS = 3600  # require ≥60 min of data
+    MIN_RECORDS = int(min_duration_minutes * 60)
 
     filtered = [
         r for r in records
@@ -444,6 +574,165 @@ def _compute_hr_drift(records: List[Dict]) -> Optional[Dict]:
         "interpretation": interpretation,
         "note": "Negative drift = HR increased vs power (decoupling). >10% suggests aerobic base is limiting factor.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Pw:Hr / Pa:Hr decoupling (get_activity_decoupling)
+# ---------------------------------------------------------------------------
+
+def _work_portion_records(records: List[Dict], laps: List[Dict]) -> tuple:
+    """Restrict records to the 'work' portion of the activity, excluding any
+    laps whose FIT 'intensity' field is warmup/cooldown, when that data is
+    present. Falls back to the whole activity otherwise.
+
+    Returns (records_subset, window_start_dt_or_None, window_end_dt_or_None).
+    """
+    if not laps or not any(lap.get("intensity") in ("warmup", "cooldown") for lap in laps):
+        return records, None, None
+
+    work_laps = [lap for lap in laps if lap.get("intensity") not in ("warmup", "cooldown")]
+    if not work_laps:
+        return records, None, None
+
+    start = _parse_iso(work_laps[0].get("start_time"))
+    last_lap = work_laps[-1]
+    last_start = _parse_iso(last_lap.get("start_time"))
+    elapsed = last_lap.get("total_elapsed_time_s")
+    if start is None or last_start is None or not elapsed:
+        return records, None, None
+    end = last_start + _dt.timedelta(seconds=float(elapsed))
+
+    filtered = []
+    for r in records:
+        ts = _parse_iso(r.get("timestamp"))
+        if ts is not None and start <= ts <= end:
+            filtered.append(r)
+
+    return (filtered if filtered else records), start, end
+
+
+def _compute_decoupling(
+    parsed: Dict[str, Any],
+    split: Optional[float],
+    min_duration_minutes: float,
+) -> Dict[str, Any]:
+    """Core computation behind get_activity_decoupling.
+
+    Operates on an already fully-parsed FIT structure (session/laps/records,
+    i.e. _parse_fit(..., include_records=True)) and returns a compact (<1KB)
+    summary — never the underlying time series.
+    """
+    records: List[Dict] = parsed.get("records") or []
+    laps: List[Dict] = parsed.get("laps") or []
+    session: Dict[str, Any] = parsed.get("session") or {}
+    is_running = str(session.get("sport", "")).lower() == "running"
+    cadence_unit = "spm" if is_running else "rpm"
+    cadence_mult = 2 if is_running else 1
+
+    work_records, w_start, w_end = _work_portion_records(records, laps)
+
+    min_records = int(min_duration_minutes * 60)
+    if len(work_records) < min_records:
+        return {
+            "error": "insufficient_data",
+            "message": (
+                f"Work portion has {len(work_records)}s of data; need >= "
+                f"{min_records}s ({min_duration_minutes} min)."
+            ),
+        }
+
+    split_fraction = 0.5 if split is None else split
+    split_fraction = min(max(split_fraction, 0.05), 0.95)
+    split_idx = round(len(work_records) * split_fraction)
+    split_idx = max(1, min(split_idx, len(work_records) - 1))
+
+    first = work_records[:split_idx]
+    second = work_records[split_idx:]
+
+    hr1 = _safe_avg([r.get("heart_rate_bpm") for r in first])
+    hr2 = _safe_avg([r.get("heart_rate_bpm") for r in second])
+
+    def _has_power(recs):
+        return any(r.get("power_w") is not None for r in recs)
+
+    # Power source priority: developer-field power -> native power -> pace
+    # fallback. power_w itself is already source-merged per record (native
+    # preferred when a single record somehow has both); this just labels
+    # which source is actually feeding this window.
+    sources = {r.get("power_source") for r in (first + second) if r.get("power_source")}
+    if "developer_field" in sources:
+        power_method = "developer_field_power"
+    elif "native" in sources:
+        power_method = "native_power"
+    else:
+        power_method = None
+
+    result: Dict[str, Any] = {}
+
+    if power_method and _has_power(first) and _has_power(second) and hr1 and hr2:
+        method = power_method
+        metric1 = _compute_normalized_power([r.get("power_w") for r in first])
+        metric2 = _compute_normalized_power([r.get("power_w") for r in second])
+        ratio1 = (metric1 / hr1) if metric1 and hr1 else None
+        ratio2 = (metric2 / hr2) if metric2 and hr2 else None
+    else:
+        method = "pace_fallback"
+        metric1 = _safe_avg([r.get("speed_mps") for r in first])
+        metric2 = _safe_avg([r.get("speed_mps") for r in second])
+        ratio1 = (metric1 / hr1) if metric1 and hr1 else None
+        ratio2 = (metric2 / hr2) if metric2 and hr2 else None
+
+    if ratio1 is None or ratio2 is None or ratio1 == 0:
+        return {
+            "error": "insufficient_data",
+            "message": "Not enough HR + power/pace data in both halves to compute decoupling.",
+        }
+
+    decoupling_pct = ((ratio2 - ratio1) / ratio1) * 100
+    if abs(decoupling_pct) < 5:
+        interpretation = "well_coupled"
+    elif abs(decoupling_pct) < 10:
+        interpretation = "moderate_drift"
+    else:
+        interpretation = "significant_decoupling"
+
+    result["method"] = method
+    result["split_fraction"] = round(split_fraction, 2)
+    result["decoupling_pct"] = round(decoupling_pct, 1)
+    result["interpretation"] = interpretation
+    result["note"] = "Negative = HR rose relative to power/pace (decoupling). >10% suggests aerobic base is limiting."
+
+    if method == "pace_fallback":
+        result["first_half"] = {"duration_s": len(first), "avg_hr_bpm": round(hr1, 1), "avg_speed_mps": round(metric1, 3)}
+        result["second_half"] = {"duration_s": len(second), "avg_hr_bpm": round(hr2, 1), "avg_speed_mps": round(metric2, 3)}
+    else:
+        result["first_half"] = {"duration_s": len(first), "avg_hr_bpm": round(hr1, 1), "normalized_power_w": round(metric1)}
+        result["second_half"] = {"duration_s": len(second), "avg_hr_bpm": round(hr2, 1), "normalized_power_w": round(metric2)}
+
+    # Cadence fade
+    cad1 = _safe_avg([r.get("cadence_rpm") for r in first])
+    cad2 = _safe_avg([r.get("cadence_rpm") for r in second])
+    if cad1 is not None and cad2 is not None:
+        result[f"avg_cadence_first_half_{cadence_unit}"] = round(cad1 * cadence_mult)
+        result[f"avg_cadence_second_half_{cadence_unit}"] = round(cad2 * cadence_mult)
+
+    # Grade guard: net elevation change (end - start altitude) per half.
+    alt1 = [r["altitude_m"] for r in first if r.get("altitude_m") is not None]
+    alt2 = [r["altitude_m"] for r in second if r.get("altitude_m") is not None]
+    if len(alt1) >= 2 and len(alt2) >= 2:
+        net1 = alt1[-1] - alt1[0]
+        net2 = alt2[-1] - alt2[0]
+        result["net_elevation_first_half_m"] = round(net1, 1)
+        result["net_elevation_second_half_m"] = round(net2, 1)
+        grade_confounded = abs(net1 - net2) > 30
+        result["grade_confounded"] = grade_confounded
+        if grade_confounded:
+            result["grade_guard_note"] = (
+                f"Net elevation differs by {round(abs(net1 - net2), 1)} m between halves — "
+                "decoupling may reflect terrain, not fatigue."
+            )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -673,8 +962,13 @@ def _compute_hrv_metrics(rr_intervals_s: List[float]) -> Optional[Dict]:
     }
 
 
-def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
-    """Parse a FIT file and extract structured cycling data."""
+def _parse_fit(fit_bytes: bytes, include_records: bool, min_duration_minutes: float = 60) -> dict:
+    """Parse a FIT file and extract structured cycling/running data.
+
+    Args:
+        min_duration_minutes: Minimum duration required before HR drift is
+            computed (see _compute_hr_drift).
+    """
     fit_bytes = _extract_fit_bytes(fit_bytes)
     fitfile = fitparse.FitFile(io.BytesIO(fit_bytes))
 
@@ -691,6 +985,13 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
     # Track last values for context at shift time
     last_cadence: Optional[float] = None
     last_grade: Optional[float] = None
+
+    # ConnectIQ developer fields discovered via 'field_description' messages,
+    # e.g. {"power": "Power", "form_power": "Form Power"}. Populated before
+    # any 'record' message that uses them, since FIT files declare developer
+    # fields ahead of the data that references them.
+    dev_field_name_by_key: Dict[str, str] = {}
+    developer_fields_found: set = set()
 
     for message in fitfile.get_messages():
         msg_type = message.name
@@ -735,6 +1036,20 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
             session = {k: v for k, v in session.items() if v is not None}
 
         # ------------------------------------------------------------------
+        # Developer field discovery (Stryd etc.) — must run before any
+        # 'record' message that references these fields; see _STRYD_ALIAS_MAP.
+        # ------------------------------------------------------------------
+        elif msg_type == "field_description":
+            field_name_raw = _get_field(message, "field_name")
+            if field_name_raw:
+                name_str = str(field_name_raw).strip()
+                if name_str:
+                    developer_fields_found.add(name_str)
+                    key = _STRYD_ALIAS_MAP.get(name_str.lower())
+                    if key:
+                        dev_field_name_by_key[key] = name_str
+
+        # ------------------------------------------------------------------
         # Lap data
         # ------------------------------------------------------------------
         elif msg_type == "lap":
@@ -756,6 +1071,7 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
                 "avg_right_pedal_smoothness_pct": _get_field(message, "avg_right_pedal_smoothness"),
                 "total_ascent_m": _get_field(message, "total_ascent"),
                 "total_descent_m": _get_field(message, "total_descent"),
+                "intensity": _get_field(message, "intensity"),
             }
             balance_raw = _get_field(message, "avg_left_right_balance")
             left_pct = _decode_left_right_balance(balance_raw)
@@ -835,9 +1151,26 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
             if ts is not None:
                 last_record_ts = ts
 
+            # Power source priority: native power-meter field first, then a
+            # Stryd/ConnectIQ developer field (running activities have no
+            # native power meter). power_source records which one fed
+            # power_w, for transparency and for get_activity_decoupling.
+            native_power = _get_field(message, "power")
+            dev_power = _dev_value(message, dev_field_name_by_key, "power")
+            if native_power is not None:
+                power_w = native_power
+                power_source = "native"
+            elif dev_power is not None:
+                power_w = dev_power
+                power_source = "developer_field"
+            else:
+                power_w = None
+                power_source = None
+
             record: Dict[str, Any] = {
                 "timestamp": str(_get_field(message, "timestamp") or ""),
-                "power_w": _get_field(message, "power"),
+                "power_w": power_w,
+                "power_source": power_source,
                 "cadence_rpm": cadence,
                 "heart_rate_bpm": _get_field(message, "heart_rate"),
                 "speed_mps": _get_field(message, "speed"),
@@ -852,6 +1185,11 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
                 "right_torque_effectiveness_pct": _get_field(message, "right_torque_effectiveness"),
                 "left_pedal_smoothness_pct": _get_field(message, "left_pedal_smoothness"),
                 "right_pedal_smoothness_pct": _get_field(message, "right_pedal_smoothness"),
+                "form_power_w": _dev_value(message, dev_field_name_by_key, "form_power"),
+                "leg_spring_stiffness_kn_m": _dev_value(message, dev_field_name_by_key, "leg_spring_stiffness"),
+                "air_power_w": _dev_value(message, dev_field_name_by_key, "air_power"),
+                "vertical_oscillation_mm": _dev_value(message, dev_field_name_by_key, "vertical_oscillation"),
+                "ground_contact_time_ms": _dev_value(message, dev_field_name_by_key, "ground_time"),
             }
             balance_raw = _get_field(message, "left_right_balance")
             left_pct = _decode_left_right_balance(balance_raw)
@@ -902,11 +1240,42 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
     if np_w and avg_w and avg_w > 0:
         session["variability_index"] = round(np_w / avg_w, 3)
 
+    # Backfill session/lap power aggregates from per-second records when the
+    # device didn't precompute them natively — i.e. running activities where
+    # power comes from a Stryd developer field rather than a power meter.
+    # Native (device-computed) aggregates are left untouched.
+    if records:
+        if session.get("avg_power_w") is None:
+            for k, v in _compute_power_aggregates_for_range(records).items():
+                session.setdefault(k, v)
+
+        for lap in laps:
+            if lap.get("avg_power_w") is not None:
+                continue
+            lap_start = _parse_iso(lap.get("start_time"))
+            elapsed = lap.get("total_elapsed_time_s")
+            if lap_start is None or not elapsed:
+                continue
+            lap_end = lap_start + _dt.timedelta(seconds=float(elapsed))
+            for k, v in _compute_power_aggregates_for_range(records, start_ts=lap_start, end_ts=lap_end).items():
+                lap[k] = v
+
+    # Cadence unit fix: FIT running cadence is per-leg rpm (e.g. 79 rpm =
+    # 158 spm). Only running activities record cadence this way — cycling's
+    # avg_cadence_rpm is genuine crank RPM and must not be doubled.
+    is_running = str(session.get("sport", "")).lower() == "running"
+    if is_running:
+        if session.get("avg_cadence_rpm") is not None:
+            session["avg_cadence_spm"] = round(session["avg_cadence_rpm"] * 2)
+        for lap in laps:
+            if lap.get("avg_cadence_rpm") is not None:
+                lap["avg_cadence_spm"] = round(lap["avg_cadence_rpm"] * 2)
+
     shift_summary = _compute_shift_summary(shifts)
 
     # Record-based analytics (computed from per-second data regardless of include_records flag)
     grade_stats = _grade_analysis(records) if records else None
-    hr_drift = _compute_hr_drift(records) if records else None
+    hr_drift = _compute_hr_drift(records, min_duration_minutes=min_duration_minutes) if records else None
     temp_stats = _compute_temperature_stats(records) if records else None
     climbs = _detect_climbs(records) if records else []
     pdc = _compute_power_duration_curve(records) if records else None
@@ -925,6 +1294,9 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
         "shifts": shifts,
     }
 
+    if developer_fields_found:
+        result["developer_fields_found"] = sorted(developer_fields_found)
+
     if climbs:
         result["climbs"] = climbs
 
@@ -942,17 +1314,6 @@ def _parse_fit(fit_bytes: bytes, include_records: bool) -> dict:
 
         # Per-lap HRV: walk laps in order, derive each lap's [start, end)
         # window from start_time + total_elapsed_time_s, filter R-R pairs.
-        import datetime as _dt
-
-        def _parse_iso(s):
-            if not s:
-                return None
-            try:
-                # FIT timestamps may be "2026-05-15 02:27:08" or with tz
-                return _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                return None
-
         for lap in laps:
             lap_start = _parse_iso(lap.get("start_time"))
             elapsed = lap.get("total_elapsed_time_s")
@@ -1007,19 +1368,26 @@ def register_tools(app):
     async def get_activity_fit_data(
         activity_id: Union[int, str],
         include_records: bool = False,
+        min_duration_minutes: float = 60,
     ) -> str:
-        """Download and parse FIT file for an activity to expose advanced cycling data.
+        """Download and parse FIT file for an activity to expose advanced cycling/running data.
 
         Returns data not available through the standard REST API, including:
         - DI2 / electronic shifting events with cadence at time of shift, grade at shift,
           gear combinations, shift quality classification, and terrain-grouped shift analysis
         - Cycling dynamics per session and lap: platform center offset (PCO), left/right power
           balance, torque effectiveness, pedal smoothness
+        - Running power from Stryd/ConnectIQ developer fields when no native power meter is
+          present: avg_power_w, max_power_w, normalized_power_w (30s rolling, 4th-power mean),
+          variability_index, ef (NP ÷ avg HR), avg_form_power_w, avg_leg_spring_stiffness_kn_m
+          per session and lap, plus a developer_fields_found list of whatever ConnectIQ fields
+          were discovered (so unrecognized ones stay visible). avg_cadence_spm is added for
+          running activities (native cadence is per-leg rpm, i.e. half of total steps/min).
         - Variability Index (NP / avg_power) per session and lap
         - Climb detection with VAM (vertical ascent rate), avg power/cadence/HR per climb,
           and W/kg per climb (using auto-fetched body weight from Garmin)
         - Grade-correlated stats: avg power, cadence, HR broken down by terrain steepness
-        - HR drift / cardiac drift coefficient (aerobic decoupling for rides ≥60 min)
+        - HR drift / cardiac drift coefficient (aerobic decoupling, gated by min_duration_minutes)
         - Temperature correlation: avg HR/power in hottest vs. coolest portions of ride
         - Power Duration Curve: best mean maximal power at 5s, 30s, 1min, 5min, 10min, 20min, 60min
         - Optional full per-second time series when include_records=True
@@ -1037,6 +1405,8 @@ def register_tools(app):
             activity_id: Garmin activity ID
             include_records: Include full per-second time series (default False).
                              Warning: adds significant data volume for long rides.
+            min_duration_minutes: Minimum activity duration required before HR drift
+                             is computed (default 60).
         """
         if not FITPARSE_AVAILABLE:
             return (
@@ -1059,7 +1429,7 @@ def register_tools(app):
             raw = bytes(fit_bytes)
 
             try:
-                parsed = _parse_fit(raw, include_records=include_records)
+                parsed = _parse_fit(raw, include_records=include_records, min_duration_minutes=min_duration_minutes)
             except Exception as parse_err:
                 return json.dumps({
                     "error": str(parse_err),
@@ -1099,6 +1469,79 @@ def register_tools(app):
 
         except Exception as e:
             return f"Error downloading FIT data for activity {activity_id}: {str(e)}"
+
+    @app.tool()
+    async def get_activity_decoupling(
+        activity_id: Union[int, str],
+        split: Optional[float] = None,
+        min_duration_minutes: float = 45,
+    ) -> str:
+        """Compute Pw:Hr (or Pa:Hr) aerobic decoupling between the first and second
+        half of an activity's *work* portion — a compact (<1KB) coaching signal,
+        never the underlying time series.
+
+        - Excludes warmup/cooldown laps (via the FIT lap 'intensity' field) from
+          the work portion when present; otherwise uses the whole activity.
+        - Power source priority: developer-field power (e.g. Stryd) -> native
+          power meter -> pace-based Pa:Hr fallback when no power data exists.
+          The 'method' field reports which was used.
+        - decoupling_pct: % change in (normalized_power_w or avg_speed_mps) ÷
+          avg_hr_bpm from the first half to the second. Negative = HR rose
+          relative to output (classic aerobic decoupling).
+        - grade_confounded: true when the two halves' net elevation change
+          differs by more than ~30 m — decoupling in that case may reflect
+          terrain, not fatigue, so treat the number with caution.
+        - Cadence fade: avg cadence (spm for running, rpm for cycling) per half.
+
+        Args:
+            activity_id: Garmin activity ID
+            split: Fraction (0-1) of the work portion's moving time at which to
+                   divide first/second half. Defaults to 0.5 (true halfway).
+            min_duration_minutes: Minimum work-portion duration required before
+                   decoupling is computed (default 45).
+        """
+        if not FITPARSE_AVAILABLE:
+            return (
+                "fitparse library is not installed. "
+                "Install it with: pip install fitparse"
+            )
+
+        try:
+            activity_id = int(activity_id)
+            from garminconnect import Garmin
+
+            fit_bytes = garmin_client.download_activity(
+                activity_id,
+                dl_fmt=Garmin.ActivityDownloadFormat.ORIGINAL,
+            )
+
+            if not fit_bytes:
+                return f"No FIT data returned for activity {activity_id}"
+
+            raw = bytes(fit_bytes)
+
+            try:
+                parsed = _parse_fit(raw, include_records=True)
+            except Exception as parse_err:
+                return json.dumps({
+                    "error": str(parse_err),
+                    "debug": {
+                        "total_bytes": len(raw),
+                        "first_16_bytes_hex": raw[:16].hex(),
+                        "hint": (
+                            "1f8b = gzip, 504b = ZIP, 0e10/0c10 = raw FIT, "
+                            "3c or 7b = HTML/JSON error from Garmin"
+                        ),
+                    }
+                }, indent=2)
+
+            result = _compute_decoupling(parsed, split=split, min_duration_minutes=min_duration_minutes)
+            result["activity_id"] = activity_id
+
+            return json.dumps(result, indent=2, default=str)
+
+        except Exception as e:
+            return f"Error computing decoupling for activity {activity_id}: {str(e)}"
 
     @app.tool()
     async def get_power_duration_curve(
@@ -1218,6 +1661,7 @@ def register_tools(app):
         activity_id: Union[int, str],
         format: str = "fit",
         output_dir: Optional[str] = None,
+        return_base64: bool = False,
     ) -> str:
         """Download an activity and save it to disk as a file.
 
@@ -1228,10 +1672,10 @@ def register_tools(app):
           1. output_dir argument (one-off; not persisted)
           2. GARMIN_FIT_DOWNLOAD_DIR environment variable
           3. persisted config (set via set_fit_download_dir)
-        If none is configured, returns status "needs_setup" with a suggested
-        default (the server's current working directory). In that case, ask the
-        user where to save, call set_fit_download_dir(path), then call this tool
-        again.
+        If none is configured AND return_base64 is False, returns status
+        "needs_setup" with a suggested default (the server's current working
+        directory). In that case, ask the user where to save, call
+        set_fit_download_dir(path), then call this tool again.
 
         Files are named "{activity_id}.{ext}" and overwrite any existing file.
 
@@ -1239,6 +1683,10 @@ def register_tools(app):
             activity_id: Garmin activity ID
             format: One of fit, gpx, tcx, csv (default fit)
             output_dir: Optional one-off directory override (not persisted)
+            return_base64: Also return the file content as a base64 string
+                           (capped at 5 MB). Use this when the calling client
+                           can't reach the MCP server's filesystem — no
+                           download directory is required in that case.
         """
         try:
             fmt = str(format).strip().lower()
@@ -1257,7 +1705,7 @@ def register_tools(app):
                 }, indent=2)
 
             download_dir = _resolve_download_dir(output_dir)
-            if download_dir is None:
+            if download_dir is None and not return_base64:
                 return json.dumps({
                     "status": "needs_setup",
                     "suggested_default": os.getcwd(),
@@ -1266,12 +1714,12 @@ def register_tools(app):
                         "No download directory configured. Ask the user where to "
                         "save activity files (offer the current working directory "
                         "as the default), then call set_fit_download_dir(path) "
-                        "before downloading."
+                        "before downloading, or pass return_base64=true to skip "
+                        "saving to disk."
                     ),
                 }, indent=2)
 
             activity_id = int(activity_id)
-            os.makedirs(download_dir, exist_ok=True)
 
             data = garmin_client.download_activity(
                 activity_id, dl_fmt=format_map[fmt]
@@ -1298,17 +1746,36 @@ def register_tools(app):
             else:
                 payload = raw
 
-            file_path = os.path.join(download_dir, f"{activity_id}.{fmt}")
-            with open(file_path, "wb") as f:
-                f.write(payload)
-
-            return json.dumps({
+            response: Dict[str, Any] = {
                 "activity_id": activity_id,
                 "format": fmt,
-                "file_path": os.path.abspath(file_path),
                 "size_bytes": len(payload),
-                "message": "Activity file saved.",
-            }, indent=2)
+            }
+
+            if download_dir is not None:
+                os.makedirs(download_dir, exist_ok=True)
+                file_path = os.path.join(download_dir, f"{activity_id}.{fmt}")
+                with open(file_path, "wb") as f:
+                    f.write(payload)
+                response["file_path"] = os.path.abspath(file_path)
+
+            if return_base64:
+                MAX_BASE64_SOURCE_BYTES = 5 * 1024 * 1024
+                if len(payload) > MAX_BASE64_SOURCE_BYTES:
+                    response["base64_error"] = (
+                        f"File is {len(payload)} bytes, exceeds the 5 MB return_base64 cap. "
+                        "Use output_dir instead if the server filesystem is reachable."
+                    )
+                else:
+                    response["content_base64"] = base64.b64encode(payload).decode("ascii")
+
+            response["message"] = (
+                "Activity file saved."
+                if download_dir is not None
+                else "Activity file returned as base64 (not saved; no download_dir configured)."
+            )
+
+            return json.dumps(response, indent=2)
 
         except Exception as e:
             return f"Error downloading activity {activity_id}: {str(e)}"
